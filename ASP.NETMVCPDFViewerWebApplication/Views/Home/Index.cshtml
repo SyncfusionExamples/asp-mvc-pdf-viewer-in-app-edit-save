@@ -1,0 +1,289 @@
+﻿@{
+    ViewBag.Title = "PDF Viewer";
+    // The standalone viewer loads pdfium.js/wasm from inside a blob-based web worker,
+    // which requires an ABSOLUTE URL (root-relative URLs fail in importScripts there).
+    var pdfViewerResourceUrl = new Uri(Request.Url, Url.Content("~/Scripts/ej2/ej2-pdfviewer-lib")).ToString();
+    // The viewer's load() also needs an absolute URL for same-origin controller actions,
+    // so pre-compute it here instead of relying on root-relative paths in JavaScript.
+    var openDocumentBaseUrl = new Uri(Request.Url, Url.Action("OpenDocument", "Home")).ToString();
+    var saveDocumentBaseUrl = new Uri(Request.Url, Url.Action("SaveDocument", "Home")).ToString();
+}
+
+<div class="pdf-workspace">
+    @* ------------------------------------------------------------------ *@
+    @* Toolbar with the requested Open / Save changes / Download actions *@
+    @* ------------------------------------------------------------------ *@
+    <div class="pdf-toolbar d-flex align-items-center flex-wrap gap-2 mb-2">
+        <button id="btnOpen" type="button" class="btn btn-primary" title="Open a PDF document hosted on this IIS server">
+            <span class="e-icons e-folder-open" style="margin-right: 4px;"></span> Open
+        </button>
+
+        <button id="btnSave" type="button" class="btn btn-success" disabled
+                title="Save the annotated PDF back to the IIS server (overwrites the hosted file)">
+            <span class="e-icons e-save" style="margin-right: 4px;"></span> Save changes
+        </button>
+
+        <button id="btnDownload" type="button" class="btn btn-secondary" disabled
+                title="Download the annotated PDF to your computer">
+            <span class="e-icons e-download" style="margin-right: 4px;"></span> Download
+        </button>
+
+        <span id="statusMessage" class="ms-2 text-muted small"></span>
+
+        <span class="ms-auto fw-semibold" id="currentDocLabel">No document loaded</span>
+    </div>
+
+    @* ------------------------------------------------------------------ *@
+    @* Document browser (modal)                                          *@
+    @* ------------------------------------------------------------------ *@
+    <div class="modal fade" id="openModal" tabindex="-1" aria-labelledby="openModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="openModalLabel">Open PDF document</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small">
+                        These PDF files are hosted on the IIS server. Select one to open it in the viewer.
+                        When you save changes, the file on the server is overwritten with your annotated copy,
+                        so the next time you (or anyone else) open it, the modified PDF is loaded.
+                    </p>
+                    <div class="table-responsive">
+                        <table class="table table-hover align-middle" id="documentTable">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Document</th>
+                                    <th>Size</th>
+                                    <th>Last modified</th>
+                                    <th style="width: 120px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="documentTableBody">
+                                <tr><td colspan="5" class="text-center text-muted py-3">Loading documents…</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@* ---------------------------------------------------------------------- *@
+@* Syncfusion PDF Viewer (standalone / client-side mode)                  *@
+@* No ServiceUrl -> annotations are flattened into the PDF in the browser, *@
+@* then posted to the server with saveAsBlob().                            *@
+@* ---------------------------------------------------------------------- *@
+<div style="height: 640px; width: 100%;">
+    @(Html.EJS().PdfViewer("pdfviewer")
+        .Height("100%")
+        .Width("100%")
+        .ResourceUrl(pdfViewerResourceUrl)
+        .EnableToolbar(true)
+        .EnableAnnotation(true)
+        .EnableTextSearch(true)
+        .EnableDownload(true)
+        .EnableFormFields(true)
+        .DocumentLoad("onDocumentLoad")
+        .DocumentLoadFailed("onDocumentLoadFailed")
+        .DocumentUnload("onDocumentUnload")
+        .Render())
+</div>
+
+@section scripts
+{
+    <script type="text/javascript">
+        (function () {
+            var viewer = null;
+            var currentFile = null;
+            var openModalInstance = null;
+            var pendingFileName = null;
+
+            // ----- helpers ---------------------------------------------------
+            function getViewer() {
+                if (!viewer) {
+                    viewer = document.getElementById('pdfviewer').ej2_instances[0];
+                }
+                return viewer;
+            }
+
+            function setStatus(text, className) {
+                var el = document.getElementById('statusMessage');
+                el.textContent = text || '';
+                el.className = 'ms-2 small ' + (className || 'text-muted');
+            }
+
+            function setButtonsEnabled(state) {
+                document.getElementById('btnSave').disabled = !state;
+                document.getElementById('btnDownload').disabled = !state;
+            }
+
+            function formatBytes(bytes) {
+                if (bytes < 1024) { return bytes + ' B'; }
+                if (bytes < 1048576) { return (bytes / 1024).toFixed(1) + ' KB'; }
+                return (bytes / 1048576).toFixed(1) + ' MB';
+            }
+
+            function escapeHtml(value) {
+                return String(value).replace(/[&<>"']/g, function (c) {
+                    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+                });
+            }
+
+            // ----- document list ----------------------------------------------
+            function refreshDocumentList() {
+                var body = document.getElementById('documentTableBody');
+                body.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">Loading documents…</td></tr>';
+
+                fetch('@Url.Action("GetDocumentList", "Home")')
+                    .then(function (response) { return response.json(); })
+                    .then(function (documents) {
+                        if (!documents || documents.length === 0) {
+                            body.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-3">' +
+                                'No PDF documents found in ~/App_Data/PDFDocuments on the server.</td></tr>';
+                            return;
+                        }
+                        body.innerHTML = '';
+                        for (var i = 0; i < documents.length; i++) {
+                            addDocumentRow(i + 1, documents[i]);
+                        }
+                    })
+                    .catch(function (error) {
+                        body.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-3">' +
+                            'Could not load the document list: ' + error + '</td></tr>';
+                    });
+            }
+
+            function addDocumentRow(index, doc) {
+                var row = document.createElement('tr');
+                row.innerHTML = '<td>' + index + '</td>' +
+                                '<td class="text-break">' + escapeHtml(doc.name) + '</td>' +
+                                '<td>' + formatBytes(doc.sizeBytes) + '</td>' +
+                                '<td>' + escapeHtml(doc.lastModified) + '</td>' +
+                                '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-primary">Open</button></td>';
+                row.querySelector('button').addEventListener('click', function () {
+                    openDocument(doc.name);
+                });
+                document.getElementById('documentTableBody').appendChild(row);
+            }
+
+            // ----- open ---------------------------------------------------------
+            function showOpenDialog() {
+                refreshDocumentList();
+                var modalEl = document.getElementById('openModal');
+                openModalInstance = bootstrap.Modal.getOrCreateInstance(modalEl);
+                openModalInstance.show();
+            }
+
+            // ----- load the selected document into the viewer --------------------
+            function openDocument(fileName) {
+                var v = getViewer();
+                currentFile = fileName;
+                // Marks that a new document is on its way, so the documentUnload
+                // event (fired by switching away from the previous document)
+                // must not reset the working state below.
+                pendingFileName = fileName;
+                setStatus('Loading "' + fileName + '"…');
+                document.getElementById('currentDocLabel').textContent = fileName;
+
+                // Unload the previous document before loading another one.
+                // NOTE: isDocumentLoaded is not exposed at runtime in this
+                // version, so pageCount is used to detect a loaded document.
+                if (v.pageCount > 0) {
+                    v.unload();
+                }
+                v.load('@openDocumentBaseUrl?file=' + encodeURIComponent(fileName));
+                pendingFileName = null;
+
+                if (openModalInstance) { openModalInstance.hide(); }
+            }
+
+            // ----- save changes back to the IIS server ----------------------------
+            function saveToServer() {
+                var v = getViewer();
+                // pageCount > 0 means a document is currently loaded
+                // (isDocumentLoaded is not exposed at runtime in this version).
+                if (!currentFile || !v.pageCount) {
+                    setStatus('Open a document before saving.', 'text-danger');
+                    return;
+                }
+
+                setStatus('Saving "' + currentFile + '" to the server…');
+
+                // saveAsBlob() exports the loaded PDF including ALL annotations
+                // (stamps, ink, shapes, free text, highlights, form fields, ...).
+                v.saveAsBlob().then(function (blob) {
+                    var data = new FormData();
+                    data.append('pdfFile', blob, currentFile);
+
+                    fetch('@saveDocumentBaseUrl?file=' + encodeURIComponent(currentFile),
+                            { method: 'POST', body: data })
+                        .then(function (response) { return response.json(); })
+                        .then(function (result) {
+                            if (result.success) {
+                                setStatus('Saved "' + currentFile + '" on the server. Reload it to see the stored annotations.', 'text-success');
+                            } else {
+                                setStatus(result.message || 'Save failed.', 'text-danger');
+                            }
+                        })
+                        .catch(function (error) {
+                            setStatus('Save failed: ' + error, 'text-danger');
+                        });
+                }).catch(function (error) {
+                    setStatus('Could not export the annotated PDF: ' + error, 'text-danger');
+                });
+            }
+
+            // ----- download the annotated PDF to the client -----------------------
+            function downloadAnnotated() {
+                var v = getViewer();
+                if (!currentFile || !v.pageCount) {
+                    setStatus('Open a document before downloading.', 'text-danger');
+                    return;
+                }
+                // Built-in download: exports the PDF with all annotations included.
+                v.download();
+                setStatus('Downloading "' + currentFile + '"…', 'text-success');
+            }
+
+            // ----- PDF Viewer events -----------------------------------------------
+            function onDocumentLoad() {
+                // Give the document a friendly name: without this, downloads would be
+                // named after the action ("OpenDocument?file=...") instead of the PDF file.
+                getViewer().fileName = currentFile;
+                setButtonsEnabled(true);
+                setStatus('"' + currentFile + '" loaded. Annotate it, then use "Save changes" or "Download".', 'text-success');
+            }
+
+            function onDocumentLoadFailed(args) {
+                setButtonsEnabled(false);
+                setStatus('Failed to load the document.' + (args && args.message ? ' ' + args.message : ''), 'text-danger');
+            }
+
+            function onDocumentUnload() {
+                // Only reset when the user really closed the document, not while
+                // a new document is being loaded.
+                if (pendingFileName) { return; }
+                setButtonsEnabled(false);
+                currentFile = null;
+                document.getElementById('currentDocLabel').textContent = 'No document loaded';
+                setStatus('');
+            }
+
+            // expose the event handlers for the MVC wrapper
+            window.onDocumentLoad = onDocumentLoad;
+            window.onDocumentLoadFailed = onDocumentLoadFailed;
+            window.onDocumentUnload = onDocumentUnload;
+
+            // ----- wire the toolbar buttons -----------------------------------------
+            document.getElementById('btnOpen').addEventListener('click', showOpenDialog);
+            document.getElementById('btnDownload').addEventListener('click', downloadAnnotated);
+            document.getElementById('btnSave').addEventListener('click', saveToServer);
+        })();
+    </script>
+}
